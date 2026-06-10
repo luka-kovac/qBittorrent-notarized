@@ -113,6 +113,25 @@ jobs:
           cmake --build build
           sudo cmake --install build
 
+      - name: Install Apple Certificate
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PASSWORD $KEYCHAIN_PATH
+          
+          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychains -d user -s $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
       - name: Build qBittorrent
         run: |
           CXXFLAGS="$CXXFLAGS -DQT_FORCE_ASSERTS -Werror -Wno-error=deprecated-declarations" \
@@ -134,24 +153,64 @@ jobs:
           else
             build/qbittorrent-nox.app/Contents/MacOS/qbittorrent-nox -v
           fi
-
-      - name: Prepare build artifacts
+          
+      - name: Prepare, Sign, and Notarize build artifacts
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
         run: |
           appName="qbittorrent"
           if [ "${{ matrix.qbt_gui }}" = "GUI=OFF" ]; then
             appName="qbittorrent-nox"
           fi
+
           pushd build
-          # packaging
+
+          # 1. Package the frameworks natively with Qt's deploy tool
           macdeployqt "$appName.app" -no-strip
-          # code signing
+
+          # Clear extended attributes that break signatures
           xattr -cr "$appName.app"
-          codesign --force --sign - \
-            "$appName.app" \
-            "$appName.app/Contents/Frameworks"/* \
-            "$appName.app/Contents/MacOS/$appName"
+
+          echo "Starting recursive deep signing for Qt apps..."
+          
+          # 2. Sign embedded items from the inside out (Crucial for Qt bundles)
+          # Sign plugins
+          if [ -d "$appName.app/Contents/PlugIns" ]; then
+            find "$appName.app/Contents/PlugIns" -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --options runtime --timestamp --sign "Developer ID Application: Your Name ($TEAM_ID)" {} \;
+          fi
+
+          # Sign libraries/frameworks
+          if [ -d "$appName.app/Contents/Frameworks" ]; then
+            find "$appName.app/Contents/Frameworks" -type f \( -name "*.dylib" -o -name "*.framework" -o -perm +111 \) -exec codesign --force --options runtime --timestamp --sign "Developer ID Application: Your Name ($TEAM_ID)" {} \;
+          fi
+
+          # 3. Sign the primary executable and main bundle wrapper
+          codesign --force --options runtime --timestamp --sign "Developer ID Application: $DEVELOPER_NAME ($TEAM_ID)" "$appName.app/Contents/MacOS/$appName"
+          codesign --force --options runtime --timestamp --sign "Developer ID Application: $DEVELOPER_NAME ($TEAM_ID)" "$appName.app"
+
+          # Verify structural integrity
           codesign --verify --deep --strict -v "$appName.app"
-          # create .dmg
+
+          # 4. Package into a zip archive strictly for Notarization delivery
+          echo "Packaging zip file for Apple Notary submission..."
+          ditto -c -k --keepParent "$appName.app" "$appName.zip"
+
+          # 5. Submit to Apple Notary Service
+          echo "Submitting to Apple Notary..."
+          xcrun notarytool submit "$appName.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APP_SPECIFIC_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --wait
+
+          # 6. Staple the approved notarization ticket back onto the local app structure
+          echo "Stapling notarization ticket..."
+          xcrun stapler staple "$appName.app"
+
+          # 7. Create the final distributed disk image (.dmg) containing the stapled app
+          echo "Generating final distribution DMG..."
           PACKAGE_RETRY=0
           while [ "$PACKAGE_RETRY" -lt "3" ]; do
             if hdiutil create -fs HFS+ -srcfolder "$appName.app" -volname "$appName" "$appName.dmg"; then
@@ -161,15 +220,17 @@ jobs:
             PACKAGE_RETRY=$((PACKAGE_RETRY + 1))
             echo "Retry $PACKAGE_RETRY..."
           done
+
           popd
-          # prepare upload folder
+
+          # Prepare upload folder for the final step to capture
           mkdir upload
           cp "build/$appName.dmg" upload
           mkdir upload/cmake
           cp build/compile_commands.json upload/cmake
           mkdir upload/cmake/libtorrent
           cp ${{ env.libtorrent_path }}/build/compile_commands.json upload/cmake/libtorrent
-
+          
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:

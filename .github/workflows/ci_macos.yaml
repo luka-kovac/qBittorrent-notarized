@@ -159,6 +159,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
+          DEVELOPER_NAME: ${{ secrets.DEVELOPER_NAME }}
         run: |
           appName="qbittorrent"
           if [ "${{ matrix.qbt_gui }}" = "GUI=OFF" ]; then

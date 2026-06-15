@@ -122,22 +122,33 @@ jobs:
           CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-          # Decode base64 string
-          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+          # 1. Decode the base64 string
+          # Using standard formatting flags to avoid hidden newline wrapping errors
+          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > $CERTIFICATE_PATH
 
-          # Create custom runner keychain
+          # 2. Re-verify the file actually decoded as a valid P12
+          if [ ! -s "$CERTIFICATE_PATH" ]; then
+            echo "ERROR: Decoded certificate file is empty! Check your Base64 secret format."
+            exit 1
+          fi
+
+          # 3. Build and unlock the keychain
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
-          # Import .p12 distribution file
+          # 4. Import the .p12 certificate
           security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
           
-          # Map both temporary and existing system keychains into bounds
+          # 5. FIX: Make our custom keychain the temporary System Default search location
+          security default-keychain -s $KEYCHAIN_PATH
           security list-keychains -d user -s $KEYCHAIN_PATH $(security list-keychains -d user | tr -d '"')
-          
-          # Remove UI execution prompt gate locks
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # 6. DIAGNOSTIC PRINT: Show exactly what identities codesign can see right now
+          echo "=== AVAILABLE SIGNING IDENTITIES IN CI RUNNER ==="
+          security find-identity -v -p codesigning
+          echo "================================================"
           
       - name: Build qBittorrent
         run: |

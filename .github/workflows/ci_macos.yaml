@@ -2,7 +2,7 @@ name: CI - macOS
 
 on: [pull_request, push, workflow_dispatch]
 
-permissions: {}
+permissions: write-all
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -43,6 +43,17 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
+
+      - name: Extract qBittorrent Version
+        id: qbt_version
+        run: |
+          # Parse the version line from CMakeLists.txt using grep and sed
+          VERSION=$(grep -m 1 "project(qbittorrent VERSION" CMakeLists.txt | sed -E 's/.*VERSION ([0-9.]+).*/\1/')
+          
+          echo "Detected qBittorrent Version: $VERSION"
+          
+          # Save it cleanly to the GitHub outputs boundary
+          echo "version=v$VERSION" >> $GITHUB_OUTPUT
 
       - name: Install dependencies
         uses: nick-fields/retry@v4
@@ -272,3 +283,23 @@ jobs:
         with:
           name: qBittorrent-CI_macOS_${{ matrix.qbt_gui }}_libtorrent-${{ matrix.libtorrent.version }}_Qt-${{ matrix.qt_version }}
           path: upload
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Reads "v" + parsed version + run number (e.g., v5.0.0-build12)
+          tag_name: ${{ steps.qbt_version.outputs.version }}-build${{ github.run_number }}
+          name: "qBittorrent Notarized ${{ steps.qbt_version.outputs.version }} (Build ${{ github.run_number }})"
+          body: |
+            Automated custom notarized build of qBittorrent.
+            
+            - **Upstream Source Version:** ${{ steps.qbt_version.outputs.version }}
+            - **Status:** Fully signed with Developer ID and Notarized by Apple.
+          draft: false
+          prerelease: false
+          files: |
+            build/*.dmg
+
+
+
+

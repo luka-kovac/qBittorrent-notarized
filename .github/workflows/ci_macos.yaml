@@ -138,7 +138,7 @@ jobs:
           
           # Remove UI execution prompt gate locks
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-
+          
       - name: Build qBittorrent
         run: |
           CXXFLAGS="$CXXFLAGS -DQT_FORCE_ASSERTS -Werror -Wno-error=deprecated-declarations" \

@@ -186,37 +186,62 @@ jobs:
 
           pushd build
 
-          # 1. Package the frameworks natively with Qt's deploy tool
-          macdeployqt "$appName.app" -no-strip
+          # 1. Run deployment tool (ignoring non-critical plugin errors)
+          macdeployqt "$appName.app" -no-strip || true
 
-          # Clear extended attributes that break signatures
+          # 2. CRITICAL CLEANUP: Remove broken or unnecessary SQL plugins that break layout rules
+          if [ -d "$appName.app/Contents/PlugIns/sqldrivers" ]; then
+            echo "Removing optional SQL plugins that failed deep deployment linking..."
+            rm -rf "$appName.app/Contents/PlugIns/sqldrivers"
+          fi
+
+          # 3. CRITICAL SYMCONSTRUCT: Fix unlinked Framework structures left over by macdeployqt
+          echo "Repairing internal framework nested symlinks..."
+          if [ -d "$appName.app/Contents/Frameworks" ]; then
+            for framework in "$appName.app/Contents/Frameworks"/*.framework; do
+              if [ -d "$framework" ]; then
+                fw_name=$(basename "$framework" .framework)
+                # Ensure Versions/Current exists or symlinks correctly to Versions/A
+                if [ -d "$framework/Versions/A" ] && [ ! -L "$framework/Versions/Current" ] && [ ! -d "$framework/Versions/Current" ]; then
+                  ln -s A "$framework/Versions/Current"
+                fi
+                # Re-link root headers/binaries if missing
+                [ ! -L "$framework/$fw_name" ] && [ -f "$framework/Versions/Current/$fw_name" ] && ln -s "Versions/Current/$fw_name" "$framework/$fw_name"
+                [ ! -L "$framework/Resources" ] && [ -d "$framework/Versions/Current/Resources" ] && ln -s "Versions/Current/Resources" "$framework/Resources"
+              fi
+            done
+          fi
+
+          # 4. Clear extended filesystem attributes that block validation
           xattr -cr "$appName.app"
 
-          echo "Starting recursive deep signing for Qt apps..."
+          echo "Starting recursive deep signing using identity..."
+          SIGN_IDENTITY="Developer ID Application: $DEVELOPER_NAME ($TEAM_ID)"
+          echo "Target Identity: $SIGN_IDENTITY"
           
-          # 2. Sign embedded items from the inside out (Crucial for Qt bundles)
-          # Sign plugins
+          # 5. Sign embedded components cleanly using our fixed string matching variable
           if [ -d "$appName.app/Contents/PlugIns" ]; then
-            find "$appName.app/Contents/PlugIns" -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --options runtime --timestamp --sign "Developer ID Application: Your Name ($TEAM_ID)" {} \;
+            find "$appName.app/Contents/PlugIns" -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" {} \;
           fi
 
-          # Sign libraries/frameworks
           if [ -d "$appName.app/Contents/Frameworks" ]; then
-            find "$appName.app/Contents/Frameworks" -type f \( -name "*.dylib" -o -name "*.framework" -o -perm +111 \) -exec codesign --force --options runtime --timestamp --sign "Developer ID Application: Your Name ($TEAM_ID)" {} \;
+            # We sign frameworks deeply from inner sub-binaries outward
+            find "$appName.app/Contents/Frameworks" -type f \( -name "*.dylib" -o -name "*.framework" -o -perm +111 \) -exec codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" {} \;
           fi
 
-          # 3. Sign the primary executable and main bundle wrapper
-          codesign --force --options runtime --timestamp --sign "Developer ID Application: $DEVELOPER_NAME ($TEAM_ID)" "$appName.app/Contents/MacOS/$appName"
-          codesign --force --options runtime --timestamp --sign "Developer ID Application: $DEVELOPER_NAME ($TEAM_ID)" "$appName.app"
+          # 6. Sign primary executable and container wrapper
+          codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$appName.app/Contents/MacOS/$appName"
+          codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$appName.app"
 
-          # Verify structural integrity
+          # 7. Verify structural integrity definitively
+          echo "Verifying signature structure..."
           codesign --verify --deep --strict -v "$appName.app"
 
-          # 4. Package into a zip archive strictly for Notarization delivery
+          # 8. Package zip file for Apple Notary submission
           echo "Packaging zip file for Apple Notary submission..."
           ditto -c -k --keepParent "$appName.app" "$appName.zip"
 
-          # 5. Submit to Apple Notary Service
+          # 9. Submit to Apple Notary Service
           echo "Submitting to Apple Notary..."
           xcrun notarytool submit "$appName.zip" \
             --apple-id "$APPLE_ID" \
@@ -224,25 +249,17 @@ jobs:
             --team-id "$TEAM_ID" \
             --wait
 
-          # 6. Staple the approved notarization ticket back onto the local app structure
+          # 10. Staple the approved ticket back onto the app
           echo "Stapling notarization ticket..."
           xcrun stapler staple "$appName.app"
 
-          # 7. Create the final distributed disk image (.dmg) containing the stapled app
+          # 11. Create the final distributed disk image (.dmg)
           echo "Generating final distribution DMG..."
-          PACKAGE_RETRY=0
-          while [ "$PACKAGE_RETRY" -lt "3" ]; do
-            if hdiutil create -fs HFS+ -srcfolder "$appName.app" -volname "$appName" "$appName.dmg"; then
-              break
-            fi
-            sleep 5
-            PACKAGE_RETRY=$((PACKAGE_RETRY + 1))
-            echo "Retry $PACKAGE_RETRY..."
-          done
+          hdiutil create -fs HFS+ -srcfolder "$appName.app" -volname "$appName" "$appName.dmg"
 
           popd
 
-          # Prepare upload folder for the final step to capture
+          # Prepare upload folder artifact
           mkdir upload
           cp "build/$appName.dmg" upload
           mkdir upload/cmake

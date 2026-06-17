@@ -44,16 +44,29 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Extract qBittorrent Version
+      - name: Extract qBittorrent Version from Header
         id: qbt_version
         run: |
-          # Parse the version line from CMakeLists.txt using grep and sed
-          VERSION=$(grep -m 1 "project(qbittorrent VERSION" CMakeLists.txt | sed -E 's/.*VERSION ([0-9.]+).*/\1/')
+          VERSION_FILE="src/base/version.h.in"
           
-          echo "Detected qBittorrent Version: $VERSION"
+          # Extract major, minor, and bugfix components using awk
+          MAJOR=$(awk '/#define QBT_VERSION_MAJOR/ {print $3}' $VERSION_FILE)
+          MINOR=$(awk '/#define QBT_VERSION_MINOR/ {print $3}' $VERSION_FILE)
+          BUGFIX=$(awk '/#define QBT_VERSION_BUGFIX/ {print $3}' $VERSION_FILE)
+          STATUS=$(awk '/#define QBT_VERSION_STATUS/ {print $3}' $VERSION_FILE | tr -d '"')
+
+          # Construct the clean version string
+          # If STATUS is not empty (e.g., "beta1"), append it with a hyphen
+          if [ -n "$STATUS" ]; then
+            FULL_VERSION="${MAJOR}.${MINOR}.${BUGFIX}-${STATUS}"
+          else
+            FULL_VERSION="${MAJOR}.${MINOR}.${BUGFIX}"
+          fi
+
+          echo "Detected qBittorrent Version from source: v$FULL_VERSION"
           
-          # Save it cleanly to the GitHub outputs boundary
-          echo "version=v$VERSION" >> $GITHUB_OUTPUT
+          # Save it cleanly to GitHub outputs
+          echo "version=v$FULL_VERSION" >> $GITHUB_OUTPUT
 
       - name: Install dependencies
         uses: nick-fields/retry@v4
@@ -287,13 +300,13 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # Reads "v" + parsed version + run number (e.g., v5.0.0-build12)
+          # This pulls the parsed version from the step above (e.g., v5.2.1-build14)
           tag_name: ${{ steps.qbt_version.outputs.version }}-build${{ github.run_number }}
           name: "qBittorrent Notarized ${{ steps.qbt_version.outputs.version }} (Build ${{ github.run_number }})"
           body: |
-            Automated custom notarized build of qBittorrent.
+            Automated custom notarized build of qBittorrent, not affiliated with the main project.
             
-            - **Upstream Source Version:** ${{ steps.qbt_version.outputs.version }}
+            - **Source Code Version:** ${{ steps.qbt_version.outputs.version }}
             - **Status:** Fully signed with Developer ID and Notarized by Apple.
           draft: false
           prerelease: false

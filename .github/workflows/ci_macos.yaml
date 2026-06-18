@@ -17,6 +17,8 @@ jobs:
     runs-on: macos-latest
     permissions:
       actions: write
+      contents: write
+      statuses: write
 
     strategy:
       fail-fast: false

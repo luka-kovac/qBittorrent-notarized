@@ -9,8 +9,12 @@ appName="${APP_PATH%.app}"
 SIGNING_TEMP="$(mktemp -d "${RUNNER_TEMP}/notarize.XXXXXX")"
 CERTIFICATE_PATH="${SIGNING_TEMP}/build_certificate.p12"
 KEYCHAIN_PATH="${SIGNING_TEMP}/app-signing.keychain-db"
+ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')"
 
 cleanup() {
+  if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]]; then
+    security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || true
+  fi
   security delete-keychain "${KEYCHAIN_PATH}" >/dev/null 2>&1 || true
   rm -rf "${SIGNING_TEMP}"
 }
@@ -36,6 +40,15 @@ security import "${CERTIFICATE_PATH}" \
   -t cert \
   -f pkcs12 \
   -k "${KEYCHAIN_PATH}"
+
+# codesign requires the identity's keychain to be on the user search list,
+# even when --keychain is supplied. Retain the runner's existing keychains.
+EXISTING_KEYCHAINS=()
+while IFS= read -r keychain; do
+  EXISTING_KEYCHAINS+=("${keychain}")
+done < <(security list-keychains -d user | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
+security list-keychains -d user -s "${KEYCHAIN_PATH}" "${EXISTING_KEYCHAINS[@]}"
+security default-keychain -d user -s "${KEYCHAIN_PATH}"
 
 security set-key-partition-list \
   -S apple-tool:,apple:,codesign: \

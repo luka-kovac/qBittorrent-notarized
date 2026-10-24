@@ -40,6 +40,10 @@ jobs:
       local_tag: ${{ steps.resolve.outputs.local_tag }}
       should_build: ${{ steps.check.outputs.should_build }}
       matrix: ${{ steps.upstream_matrix.outputs.matrix }}
+      runner: ${{ steps.upstream_matrix.outputs.runner }}
+      fail_fast: ${{ steps.upstream_matrix.outputs.fail_fast }}
+      max_parallel: ${{ steps.upstream_matrix.outputs.max_parallel }}
+      timeout: ${{ steps.upstream_matrix.outputs.timeout }}
 
     steps:
       - name: Resolve and validate upstream release
@@ -82,81 +86,6 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "local_tag=${LOCAL_TAG}" >> "${GITHUB_OUTPUT}"
 
-      - name: Set up Ruby for upstream workflow parsing
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.3"
-
-      - name: Read the upstream macOS build matrix
-        id: upstream_matrix
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPSTREAM_TAG: ${{ steps.resolve.outputs.tag }}
-          UPSTREAM_WORKFLOW: ${{ runner.temp }}/upstream-ci-macos.yaml
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          gh api             "repos/qbittorrent/qBittorrent/contents/.github/workflows/ci_macos.yaml?ref=${UPSTREAM_TAG}"             --jq '.content' |
-            base64 --decode > "${UPSTREAM_WORKFLOW}"
-
-          ruby <<'RUBY'
-          require "json"
-          require "yaml"
-
-          workflow = YAML.safe_load(
-            File.read(ENV.fetch("UPSTREAM_WORKFLOW")),
-            aliases: false
-          )
-
-          matrix = workflow
-            .fetch("jobs")
-            .fetch("ci")
-            .fetch("strategy")
-            .fetch("matrix")
-
-          required_axes = %w[libtorrent qbt_gui qt_version]
-          missing_axes = required_axes.reject { |axis| matrix.key?(axis) }
-          unless missing_axes.empty?
-            abort("Upstream macOS matrix is missing: #{missing_axes.join(", ")}")
-          end
-
-          libtorrent = matrix.fetch("libtorrent").map do |entry|
-            normalized = entry.transform_keys(&:to_s)
-            required_fields = %w[
-              version
-              boost_major_version
-              boost_minor_version
-              boost_patch_version
-            ]
-            missing_fields = required_fields.reject do |field|
-              normalized.key?(field)
-            end
-
-            unless missing_fields.empty?
-              abort(
-                "Upstream libtorrent entry is missing: #{missing_fields.join(", ")}"
-              )
-            end
-
-            normalized["libt_build_flags"] ||= ""
-            normalized
-          end
-
-          build_matrix = {
-            "libtorrent" => libtorrent,
-            "qbt_gui" => matrix.fetch("qbt_gui"),
-            "qt_version" => matrix.fetch("qt_version")
-          }
-
-          matrix_json = JSON.generate(build_matrix)
-          puts("Upstream build matrix: #{matrix_json}")
-
-          File.open(ENV.fetch("GITHUB_OUTPUT"), "a") do |output|
-            output.puts("matrix=#{matrix_json}")
-          end
-          RUBY
-
       - name: Check whether this release has already been built
         id: check
         env:
@@ -184,6 +113,48 @@ jobs:
             echo "should_build=true" >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Checkout release tooling
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/checkout@v6
+        with:
+          path: release-tools
+          persist-credentials: false
+
+      - name: Set up Ruby for upstream workflow parsing
+        if: steps.check.outputs.should_build == 'true'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Prepare the exact upstream macOS build
+        if: steps.check.outputs.should_build == 'true'
+        id: upstream_matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.tag }}
+          UPSTREAM_WORKFLOW: ${{ runner.temp }}/upstream-ci-macos.yaml
+          ACTION_DIR: ${{ runner.temp }}/upstream-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api \
+            "repos/qbittorrent/qBittorrent/contents/.github/workflows/ci_macos.yaml?ref=${UPSTREAM_TAG}" \
+            --jq '.content' |
+            base64 --decode > "${UPSTREAM_WORKFLOW}"
+
+          ruby release-tools/.github/scripts/prepare_upstream.rb \
+            "${UPSTREAM_WORKFLOW}" "${ACTION_DIR}"
+          cp release-tools/.github/scripts/notarize.sh "${ACTION_DIR}/notarize.sh"
+
+      - name: Share the upstream build action
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: upstream-build-action
+          path: ${{ runner.temp }}/upstream-build
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: >-
       Build (${{ matrix.qbt_gui }},
@@ -191,24 +162,21 @@ jobs:
       Qt ${{ matrix.qt_version }})
     needs: resolve_upstream
     if: needs.resolve_upstream.outputs.should_build == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(needs.resolve_upstream.outputs.runner) }}
+    timeout-minutes: ${{ fromJSON(needs.resolve_upstream.outputs.timeout) }}
 
     permissions:
       actions: write
       contents: read
-      statuses: write
 
     strategy:
-      fail-fast: false
+      fail-fast: ${{ fromJSON(needs.resolve_upstream.outputs.fail_fast) }}
+      max-parallel: ${{ fromJSON(needs.resolve_upstream.outputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.resolve_upstream.outputs.matrix) }}
-
-    env:
-      boost_path: "${{ github.workspace }}/../boost"
-      libtorrent_path: "${{ github.workspace }}/../libtorrent"
 
     steps:
       - name: Checkout exact upstream qBittorrent release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: qbittorrent/qBittorrent
           ref: ${{ needs.resolve_upstream.outputs.tag }}
@@ -249,296 +217,23 @@ jobs:
           echo "Detected qBittorrent version from source: v${FULL_VERSION}"
           echo "version=v${FULL_VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: Install dependencies
-        uses: nick-fields/retry@v4
-        env:
-          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
-          HOMEBREW_NO_INSTALL_CLEANUP: 1
+      - name: Download the upstream build action
+        uses: actions/download-artifact@v8
         with:
-          timeout_seconds: 90
-          retry_wait_seconds: 20
-          max_attempts: 6
-          command: |
-            brew update > /dev/null
-            brew install \
-              openssl@3 zlib
-            # preinstalled on the image: cmake ninja
+          name: upstream-build-action
+          path: .notarized-release/upstream-build
 
-      - name: Setup ccache
-        uses: Chocobo1/setup-ccache-action@v1
+      - name: Run upstream build with Developer ID signing and notarization
+        uses: ./.notarized-release/upstream-build
         with:
-          store_cache: true
-          update_packager_index: false
-          ccache_options: |
-            max_size=1G
-
-      - name: Install boost
-        shell: bash
-        run: |
-          boost_url="https://archives.boost.io/release/${{ matrix.libtorrent.boost_major_version }}.${{ matrix.libtorrent.boost_minor_version }}.${{ matrix.libtorrent.boost_patch_version }}/source/boost_${{ matrix.libtorrent.boost_major_version }}_${{ matrix.libtorrent.boost_minor_version }}_${{ matrix.libtorrent.boost_patch_version }}.tar.gz"
-          boost_url2="https://sourceforge.net/projects/boost/files/boost/${{ matrix.libtorrent.boost_major_version }}.${{ matrix.libtorrent.boost_minor_version }}.${{ matrix.libtorrent.boost_patch_version }}/boost_${{ matrix.libtorrent.boost_major_version }}_${{ matrix.libtorrent.boost_minor_version }}_${{ matrix.libtorrent.boost_patch_version }}.tar.gz"
-          set +e
-          curl -L -o "${{ runner.temp }}/boost.tar.gz" "${boost_url}"
-          tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
-          _exitCode="$?"
-          if [[ "${_exitCode}" -ne 0 ]]; then
-            curl -L -o "${{ runner.temp }}/boost.tar.gz" "${boost_url2}"
-            tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
-          fi
-          mv "${{ github.workspace }}/.."/boost_* "${{ env.boost_path }}"
-          cd "${{ env.boost_path }}"
-          ./bootstrap.sh
-          ./b2 stage --stagedir=./ --with-headers
-
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ matrix.qt_version }}
-          archives: qtbase qtdeclarative qtsvg qttools
-          modules: qtimageformats
-          # Qt made qtdeclarative a hard dependency. Recheck when the Qt
-          # dependency layout changes.
-          cache: true
-
-      - name: Install libtorrent
-        shell: bash
-        run: |
-          git clone \
-            --branch "v${{ matrix.libtorrent.version }}" \
-            --depth 1 \
-            --recurse-submodules \
-            https://github.com/arvidn/libtorrent.git \
-            "${{ env.libtorrent_path }}"
-          cd "${{ env.libtorrent_path }}"
-          libt_build_flags=()
-          raw_libt_build_flags="${{ matrix.libtorrent.libt_build_flags }}"
-          if [[ -n "${raw_libt_build_flags}" ]]; then
-            read -r -a libt_build_flags <<< "${raw_libt_build_flags}"
-          fi
-          cmake \
-            -B build \
-            -G "Ninja" \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_STANDARD=20 \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            -DBOOST_ROOT="${{ env.boost_path }}/lib/cmake" \
-            -Ddeprecated-functions=OFF \
-            "${libt_build_flags[@]}"
-          cmake --build build
-          sudo cmake --install build
-
-      - name: Install Apple certificate
-        env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        shell: bash
-        run: |
-          CERTIFICATE_PATH="${RUNNER_TEMP}/build_certificate.p12"
-          KEYCHAIN_PATH="${RUNNER_TEMP}/app-signing.keychain-db"
-
-          echo "${BUILD_CERTIFICATE_BASE64}" |
-            base64 --decode > "${CERTIFICATE_PATH}"
-
-          if [[ ! -s "${CERTIFICATE_PATH}" ]]; then
-            echo \
-              "ERROR: Decoded certificate file is empty. Check BUILD_CERTIFICATE_BASE64." \
-              >&2
-            exit 1
-          fi
-
-          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
-          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
-          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
-
-          security import "${CERTIFICATE_PATH}" \
-            -P "${P12_PASSWORD}" \
-            -A \
-            -t cert \
-            -f pkcs12 \
-            -k "${KEYCHAIN_PATH}"
-
-          security default-keychain -s "${KEYCHAIN_PATH}"
-          security list-keychains \
-            -d user \
-            -s "${KEYCHAIN_PATH}" \
-            $(security list-keychains -d user | tr -d '"')
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s \
-            -k "${KEYCHAIN_PASSWORD}" \
-            "${KEYCHAIN_PATH}"
-
-          echo "=== AVAILABLE SIGNING IDENTITIES IN CI RUNNER ==="
-          security find-identity -v -p codesigning
-          echo "================================================"
-
-      - name: Build qBittorrent
-        shell: bash
-        run: |
-          CXXFLAGS="$CXXFLAGS -DQT_FORCE_ASSERTS -Werror -Wno-error=deprecated-declarations -Wno-error=deprecated-literal-operator" \
-          LDFLAGS="$LDFLAGS -gz" \
-          cmake \
-            -B build \
-            -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            -DBOOST_ROOT="${{ env.boost_path }}/lib/cmake" \
-            -DTESTING=ON \
-            -DVERBOSE_CONFIGURE=ON \
-            -D${{ matrix.qbt_gui }}
-          cmake --build build --target qbt_update_translations
-          cmake --build build
-          cmake --build build --target check
-
-          if [[ "${{ matrix.qbt_gui }}" == "GUI=ON" ]]; then
-            build/qbittorrent.app/Contents/MacOS/qbittorrent -v
-          else
-            build/qbittorrent-nox.app/Contents/MacOS/qbittorrent-nox -v
-          fi
-
-      - name: Prepare, sign, and notarize build artifacts
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
-          TEAM_ID: ${{ secrets.TEAM_ID }}
-          DEVELOPER_NAME: ${{ secrets.DEVELOPER_NAME }}
-        shell: bash
-        run: |
-          appName="qbittorrent"
-          if [[ "${{ matrix.qbt_gui }}" == "GUI=OFF" ]]; then
-            appName="qbittorrent-nox"
-          fi
-
-          pushd build
-
-          # Run the deployment tool, retaining the existing tolerance for
-          # non-critical plugin deployment errors.
-          macdeployqt "${appName}.app" -no-strip || true
-
-          # Remove optional SQL plugins that can fail Apple's bundle-layout
-          # validation after deployment.
-          if [[ -d "${appName}.app/Contents/PlugIns/sqldrivers" ]]; then
-            echo "Removing optional SQL plugins..."
-            rm -rf "${appName}.app/Contents/PlugIns/sqldrivers"
-          fi
-
-          # Repair framework symlinks that macdeployqt can leave incomplete.
-          echo "Repairing internal framework symlinks..."
-          if [[ -d "${appName}.app/Contents/Frameworks" ]]; then
-            for framework in "${appName}.app/Contents/Frameworks"/*.framework; do
-              if [[ -d "${framework}" ]]; then
-                fw_name="$(basename "${framework}" .framework)"
-
-                if [[ -d "${framework}/Versions/A" ]] &&
-                  [[ ! -L "${framework}/Versions/Current" ]] &&
-                  [[ ! -d "${framework}/Versions/Current" ]]
-                then
-                  ln -s A "${framework}/Versions/Current"
-                fi
-
-                if [[ ! -L "${framework}/${fw_name}" ]] &&
-                  [[ -f "${framework}/Versions/Current/${fw_name}" ]]
-                then
-                  ln -s \
-                    "Versions/Current/${fw_name}" \
-                    "${framework}/${fw_name}"
-                fi
-
-                if [[ ! -L "${framework}/Resources" ]] &&
-                  [[ -d "${framework}/Versions/Current/Resources" ]]
-                then
-                  ln -s \
-                    "Versions/Current/Resources" \
-                    "${framework}/Resources"
-                fi
-              fi
-            done
-          fi
-
-          xattr -cr "${appName}.app"
-
-          SIGN_IDENTITY="Developer ID Application: ${DEVELOPER_NAME} (${TEAM_ID})"
-          echo "Signing with identity: ${SIGN_IDENTITY}"
-
-          if [[ -d "${appName}.app/Contents/PlugIns" ]]; then
-            find "${appName}.app/Contents/PlugIns" \
-              -type f \
-              \( -name "*.dylib" -o -perm +111 \) \
-              -exec codesign \
-                --force \
-                --options runtime \
-                --timestamp \
-                --sign "${SIGN_IDENTITY}" \
-                {} \;
-          fi
-
-          if [[ -d "${appName}.app/Contents/Frameworks" ]]; then
-            find "${appName}.app/Contents/Frameworks" \
-              -type f \
-              \( -name "*.dylib" -o -name "*.framework" -o -perm +111 \) \
-              -exec codesign \
-                --force \
-                --options runtime \
-                --timestamp \
-                --sign "${SIGN_IDENTITY}" \
-                {} \;
-          fi
-
-          codesign \
-            --force \
-            --options runtime \
-            --timestamp \
-            --sign "${SIGN_IDENTITY}" \
-            "${appName}.app/Contents/MacOS/${appName}"
-          codesign \
-            --force \
-            --options runtime \
-            --timestamp \
-            --sign "${SIGN_IDENTITY}" \
-            "${appName}.app"
-
-          echo "Verifying signature structure..."
-          codesign --verify --deep --strict -v "${appName}.app"
-
-          echo "Packaging ZIP for Apple notarization..."
-          ditto -c -k --keepParent "${appName}.app" "${appName}.zip"
-
-          echo "Submitting to Apple Notary Service..."
-          xcrun notarytool submit "${appName}.zip" \
-            --apple-id "${APPLE_ID}" \
-            --password "${APP_SPECIFIC_PASSWORD}" \
-            --team-id "${TEAM_ID}" \
-            --wait
-
-          echo "Stapling notarization ticket..."
-          xcrun stapler staple "${appName}.app"
-
-          echo "Generating final distribution DMG..."
-          hdiutil create \
-            -fs HFS+ \
-            -srcfolder "${appName}.app" \
-            -volname "${appName}" \
-            "${appName}.dmg"
-
-          popd
-
-          mkdir upload
-          cp "build/${appName}.dmg" upload
-          mkdir upload/cmake
-          cp build/compile_commands.json upload/cmake
-          mkdir upload/cmake/libtorrent
-          cp \
-            "${{ env.libtorrent_path }}/build/compile_commands.json" \
-            upload/cmake/libtorrent
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: qBittorrent-CI_macOS_${{ matrix.qbt_gui }}_libtorrent-${{ matrix.libtorrent.version }}_Qt-${{ matrix.qt_version }}
-          path: upload
-          if-no-files-found: error
+          matrix: ${{ toJSON(matrix) }}
+          build_certificate_base64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          p12_password: ${{ secrets.P12_PASSWORD }}
+          keychain_password: ${{ secrets.KEYCHAIN_PASSWORD }}
+          apple_id: ${{ secrets.APPLE_ID }}
+          app_specific_password: ${{ secrets.APP_SPECIFIC_PASSWORD }}
+          team_id: ${{ secrets.TEAM_ID }}
+          developer_name: ${{ secrets.DEVELOPER_NAME }}
 
   publish:
     name: Publish notarized release

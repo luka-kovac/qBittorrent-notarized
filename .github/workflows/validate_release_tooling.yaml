@@ -1,0 +1,58 @@
+name: Validate release tooling
+
+on:
+  pull_request:
+    paths:
+      - .github/scripts/**
+      - .github/tests/**
+      - .github/workflows/**
+  push:
+    branches: [master]
+    paths:
+      - .github/scripts/**
+      - .github/tests/**
+      - .github/workflows/**
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Test adaptation of upstream release workflows
+        run: ruby .github/tests/prepare_upstream_test.rb
+      - name: Check signing script syntax
+        run: bash -n .github/scripts/notarize.sh
+      - name: Test public release filenames
+        run: python3 .github/tests/prepare_release_assets_test.py
+      - name: Prepare composite integration test
+        run: |
+          ruby .github/scripts/prepare_upstream.rb \
+            .github/tests/fixtures/composite-smoke.yaml \
+            .notarized-release/upstream-build
+          cat > .notarized-release/upstream-build/notarize.sh <<'BASH'
+          set -euo pipefail
+          test "$1" = example.app
+          test "$APPLE_ID" = dummy-apple-id
+          test "$TEAM_ID" = dummy-team
+          test "$CMAKE_PREFIX_PATH" = /upstream/openssl@3
+          touch "$RUNNER_TEMP/notarization-smoke-passed"
+          BASH
+      - name: Run generated composite without real credentials
+        uses: ./.notarized-release/upstream-build
+        with:
+          matrix: '{"libtorrent":{"version":"test"},"qbt_gui":"GUI=ON","qt_version":"test","ruby_version":"3.3"}'
+          build_certificate_base64: dummy-certificate
+          p12_password: dummy-password
+          keychain_password: dummy-keychain
+          apple_id: dummy-apple-id
+          app_specific_password: dummy-password
+          team_id: dummy-team
+          developer_name: dummy-name

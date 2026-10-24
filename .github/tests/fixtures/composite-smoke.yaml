@@ -1,0 +1,41 @@
+# Exercises GitHub's actual composite-action interpreter without Apple secrets.
+name: Upstream-shaped integration fixture
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        libtorrent: [{version: "test"}]
+        qbt_gui: ["GUI=ON"]
+        qt_version: ["test"]
+        ruby_version: ["3.3"]
+    env:
+      UPSTREAM_TEST_ENV: "${{ github.workspace }}/upstream"
+      UPSTREAM_MATRIX_ENV: "${{ matrix.qbt_gui }}"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Simulate upstream dependency environment
+        run: echo 'CMAKE_PREFIX_PATH=/upstream/openssl@3' >> "$GITHUB_ENV"
+      - name: Exercise a nested action with matrix inputs
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "${{ matrix.ruby_version }}"
+      - name: Verify upstream environment and matrix scope
+        if: matrix.qbt_gui == 'GUI=ON'
+        run: |
+          test "$UPSTREAM_TEST_ENV" = "$GITHUB_WORKSPACE/upstream"
+          test "$UPSTREAM_MATRIX_ENV" = "GUI=ON"
+          test "$CMAKE_PREFIX_PATH" = /upstream/openssl@3
+          test -z "${APPLE_ID:-}"
+          test '${{ matrix.qt_version }}' = test
+      - name: Prepare build artifacts
+        run: |
+          appName="example"
+          # code signing
+          codesign --force --sign - "$appName.app"
+          # create .dmg
+          test -f "$RUNNER_TEMP/notarization-smoke-passed"

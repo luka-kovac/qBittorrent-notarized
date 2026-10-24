@@ -137,11 +137,29 @@ class PrepareUpstreamTest < Minitest::Test
         bin = File.join(dir, "bin")
         FileUtils.mkdir_p(bin)
         FileUtils.mkdir_p(File.join(dir, "qbittorrent.app", "Contents", "MacOS"))
-        %w[security codesign xattr].each do |tool|
+        %w[xattr].each do |tool|
           path = File.join(bin, tool)
           File.write(path, "#!/usr/bin/env bash\nexit 0\n")
           File.chmod(0o755, path)
         end
+        File.write(File.join(bin, "security"), <<~'BASH')
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "$1" == list-keychains ]]; then
+            if [[ " $* " == *" -s "* ]]; then
+              touch "$RUNNER_TEMP/keychain-searchable"
+            else
+              echo '    "/runner/login.keychain-db"'
+            fi
+          elif [[ "$1" == default-keychain && " $* " != *" -s "* ]]; then
+            echo '    "/runner/login.keychain-db"'
+          fi
+        BASH
+        File.write(File.join(bin, "codesign"), <<~'BASH')
+          #!/usr/bin/env bash
+          # Model codesign's search-list requirement, beyond successful import.
+          test -f "$RUNNER_TEMP/keychain-searchable"
+        BASH
         File.write(File.join(bin, "ditto"), "#!/usr/bin/env bash\ntouch \"${@: -1}\"\n")
         File.write(File.join(bin, "xcrun"), <<~'BASH')
           #!/usr/bin/env bash
@@ -152,7 +170,7 @@ class PrepareUpstreamTest < Minitest::Test
             if [[ "$REJECT_SUBMISSION" == true ]]; then exit 42; fi
           fi
         BASH
-        %w[ditto xcrun].each { |tool| File.chmod(0o755, File.join(bin, tool)) }
+        %w[security codesign ditto xcrun].each { |tool| File.chmod(0o755, File.join(bin, tool)) }
         env = UpstreamBuild::SECRET_NAMES.to_h { |name| [name.upcase, "dummy"] }
         env.merge!("BUILD_CERTIFICATE_BASE64" => ["certificate"].pack("m0"),
                    "RUNNER_TEMP" => dir, "PATH" => "#{bin}:#{ENV.fetch('PATH')}",

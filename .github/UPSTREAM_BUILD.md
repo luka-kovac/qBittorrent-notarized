@@ -22,6 +22,13 @@ Release discovery, duplicate-release checks, naming, and publishing stay in the
 wrapper. All matrix builds must succeed before publication. The existing seven
 Apple signing/notarization secrets are used; no new secrets are required.
 
+Public release titles use `qBittorrent vVERSION (Notarized)`. DMGs follow upstream's
+short names with an explicit notarization label: `qbittorrent-VERSION_notarized.dmg`
+for libtorrent 1.2, `_lt20_notarized.dmg` for 2.0, and `_lt21_notarized.dmg` for 2.1.
+Headless builds use the `qbittorrent-nox` prefix. Extra Qt or libtorrent patch
+variants receive a version suffix so assets cannot overwrite one another.
+Only the published filenames change; upstream's build and packaging stay intact.
+
 Normal upstream version, dependency, action, build-flag, test, and packaging-command
 changes are picked up on the next release automatically. If upstream fundamentally
 restructures the job, changes checkout requirements, or removes the signing/DMG

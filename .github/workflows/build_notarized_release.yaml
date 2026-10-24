@@ -250,6 +250,12 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout release naming tools
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
       - name: Download all macOS build artifacts
         uses: actions/download-artifact@v8
         with:
@@ -257,33 +263,14 @@ jobs:
           path: release-assets
           merge-multiple: false
 
-      - name: Prepare uniquely named release assets
+      - name: Prepare upstream-style notarized release names
+        env:
+          QBT_VERSION: ${{ needs.resolve_upstream.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-
-          dmg_count=0
-          while IFS= read -r -d '' FILE; do
-            ARTIFACT_DIR="$(basename "$(dirname "${FILE}")")"
-            SAFE_NAME="$(
-              printf '%s' "${ARTIFACT_DIR}" |
-                sed 's/[^A-Za-z0-9._-]/-/g'
-            )"
-
-            cp "${FILE}" "dist/${SAFE_NAME}.dmg"
-            dmg_count=$((dmg_count + 1))
-          done < <(
-            find release-assets -type f -name '*.dmg' -print0
-          )
-
-          if [[ "${dmg_count}" -eq 0 ]]; then
-            echo "No DMG files were downloaded." >&2
-            exit 1
-          fi
-
-          echo "Prepared ${dmg_count} release assets:"
-          find dist -maxdepth 1 -type f -name '*.dmg' -print
+          python3 .github/scripts/prepare_release_assets.py \
+            release-assets dist "${QBT_VERSION}"
 
       - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
@@ -291,8 +278,7 @@ jobs:
           tag_name: ${{ needs.resolve_upstream.outputs.local_tag }}
           target_commitish: ${{ github.sha }}
           name: >-
-            qBittorrent Notarized
-            v${{ needs.resolve_upstream.outputs.version }}
+            qBittorrent v${{ needs.resolve_upstream.outputs.version }} (Notarized)
           body: |
             Automated custom notarized macOS builds of qBittorrent.
 

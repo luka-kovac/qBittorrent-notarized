@@ -30,6 +30,8 @@ jobs:
         run: ruby .github/tests/prepare_upstream_test.rb
       - name: Check signing script syntax
         run: bash -n .github/scripts/notarize.sh
+      - name: Test public release filenames
+        run: python3 .github/tests/prepare_release_assets_test.py
       - name: Prepare composite integration test
         run: |
           ruby .github/scripts/prepare_upstream.rb \
